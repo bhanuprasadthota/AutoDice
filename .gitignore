@@ -1,0 +1,18 @@
+# User credentials — never commit this
+config.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Playwright
+playwright-report/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
