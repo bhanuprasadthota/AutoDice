@@ -10,6 +10,8 @@ venv/
 
 # Playwright
 playwright-report/
+autodice-debug/
+autodice-logs/
 
 # macOS
 .DS_Store
