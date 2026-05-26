@@ -143,7 +143,7 @@ async def try_submit(page: Page) -> bool:
     try:
         aria = await submit_btn.get_attribute("aria-disabled")
         pending = await submit_btn.get_attribute("data-pending")
-        if str(aria).lower() == "true" or str(pending).lower() == "true":
+        if aria == "true" or pending == "true":
             print("  ⚠  Submit is disabled/pending")
             return False
     except Exception:
@@ -246,7 +246,7 @@ async def run(playwright) -> None:
             pass
 
         links = await collect_job_links(page)
-        new_links = [l for l in links if l not in seen]
+        new_links = [link for link in links if link not in seen]
         seen.update(new_links)
 
         skipped = len(links) - len(new_links)
