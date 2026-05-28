@@ -82,6 +82,7 @@ Use environment variables to control each run:
 | `AUTODICE_JOB_TITLES` | Comma-separated role override for a single run. |
 | `AUTODICE_DRY_RUN` | Set to `1` to stop before final submission. |
 | `AUTODICE_STOP_AT_APPLY` | With dry run enabled, stop before clicking Easy Apply. |
+| `AUTODICE_MANUAL_LOGIN_TIMEOUT` | Seconds to wait for manual login if Dice redirects to sign-in. Default is `300`; set `0` to disable. |
 | `AUTODICE_LOG_DIR` | Directory for CSV logs and cached job links. |
 | `AUTODICE_MAX_LOG_BYTES` | Rotate `applications.csv` after this size in bytes. |
 

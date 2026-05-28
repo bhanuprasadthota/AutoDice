@@ -15,6 +15,7 @@ from config import DICE_EMAIL, DICE_PASSWORD, JOB_TITLES, LOCATION
 
 MAX_APPLICATIONS = int(os.getenv("AUTODICE_MAX_APPLICATIONS", "0") or "0")
 MAX_SEARCH_PAGES = int(os.getenv("AUTODICE_MAX_SEARCH_PAGES", "0") or "0")
+MANUAL_LOGIN_TIMEOUT = int(os.getenv("AUTODICE_MANUAL_LOGIN_TIMEOUT", "300") or "300")
 DRY_RUN = os.getenv("AUTODICE_DRY_RUN", "").lower() in {"1", "true", "yes"}
 STOP_AT_APPLY = os.getenv("AUTODICE_STOP_AT_APPLY", "").lower() in {"1", "true", "yes"}
 DEBUG_DIR = Path(os.getenv("AUTODICE_DEBUG_DIR", "autodice-debug"))
@@ -220,6 +221,60 @@ async def click_when_enabled(locator, timeout_ms: int = 20000) -> bool:
         except Exception:
             await asyncio.sleep(0.25)
 
+    return False
+
+
+async def sign_in_if_needed(page: Page) -> bool:
+    """Sign in when Dice redirects the current flow to the login page."""
+    if "/dashboard/login" not in page.url:
+        return False
+
+    print("  Session login required; signing in")
+
+    for _ in range(2):
+        email_input = page.locator("input[type=email]").first
+        if await email_input.count() > 0 and await email_input.is_visible():
+            await email_input.fill(DICE_EMAIL)
+            if not await click_when_enabled(page.locator("button[type=submit]").first, 10000):
+                return True
+            await page.wait_for_timeout(1500)
+
+        password_input = page.locator("input[type=password]").first
+        if await password_input.count() > 0 and await password_input.is_visible():
+            await password_input.fill(DICE_PASSWORD)
+            sign_in_button = page.locator(
+                "button:has-text('Sign In'), button[type=submit]"
+            ).first
+            if not await click_when_enabled(sign_in_button, 15000):
+                return True
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                await page.wait_for_timeout(3000)
+
+        if "/dashboard/login" not in page.url:
+            return True
+
+    if MANUAL_LOGIN_TIMEOUT <= 0:
+        return False
+
+    print(
+        "  Manual login required. Complete the Dice login in the browser; "
+        f"the bot will resume automatically for up to {MANUAL_LOGIN_TIMEOUT} seconds."
+    )
+    deadline = asyncio.get_running_loop().time() + MANUAL_LOGIN_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        if "/dashboard/login" not in page.url:
+            print("  Manual login detected; resuming")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            return True
+        await page.wait_for_timeout(1000)
+
+    print("  Manual login timed out")
     return False
 
 
@@ -466,6 +521,8 @@ async def apply_to_job(page: Page, link: str, role: str) -> dict[str, str]:
         print("  Error: page failed to load")
         return {"title": role, "status": "load_failed", "message": "Page failed to load"}
 
+    await sign_in_if_needed(page)
+
     title_el = page.locator("h1[data-cy='jobTitle']")
     title = (await title_el.inner_text()).strip() if await title_el.count() else role
     print(f"  Job: {title}")
@@ -508,8 +565,11 @@ async def apply_to_job(page: Page, link: str, role: str) -> dict[str, str]:
         }
 
     await page.wait_for_timeout(1500)
+    await sign_in_if_needed(page)
 
     for _ in range(4):
+        await sign_in_if_needed(page)
+
         if await has_confirmation(page):
             print("  Submitted")
             return {"title": title, "status": "submitted", "message": "Submitted"}
@@ -551,14 +611,8 @@ async def run(playwright) -> None:
     logged_links = application_log.processed_links()
     print(f"Loaded {len(logged_links)} previously logged job links")
 
-    # ── Login ──────────────────────────────────────────────────────────────
     await page.goto("https://www.dice.com/dashboard/login")
-    await page.fill("input[type=email]", DICE_EMAIL)
-    await page.click("button[type=submit]")
-    await page.wait_for_timeout(1500)
-    await page.fill("input[type=password]", DICE_PASSWORD)
-    await page.click("button[type=submit]")
-    await page.wait_for_load_state("networkidle")
+    await sign_in_if_needed(page)
     print("Logged in\n")
 
     # ── Search & apply ─────────────────────────────────────────────────────
