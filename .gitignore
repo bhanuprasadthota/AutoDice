@@ -1,8 +1,9 @@
-# User credentials — never commit this
+# User credentials - never commit this
 config.py
 
 # Python
 __pycache__/
+.pycache/
 *.pyc
 *.pyo
 .venv/
@@ -16,5 +17,4 @@ autodice-logs/
 # macOS
 .DS_Store
 
-# Claude Code
 .claude/

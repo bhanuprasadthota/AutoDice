@@ -1,11 +1,14 @@
 # AutoDice
 
-Automatically applies to **Easy Apply** jobs on [Dice.com](https://www.dice.com) using Playwright browser automation.
+AutoDice is a Playwright-based automation tool for applying to Dice.com Easy Apply jobs from a configured Dice account.
 
-- Searches multiple job titles in one run
-- Skips jobs already applied to (Dice detects this natively)
-- Deduplicates links within a session so the same posting isn't hit twice
-- Handles single-page and two-page application flows
+- Searches one or more configured job titles.
+- Uses Dice's Easy Apply filter.
+- Caches extracted job links in CSV so future runs do not re-scrape the same searches.
+- Logs every visited job and result status to CSV.
+- Skips links already processed in previous runs.
+- Supports bounded runs for safer testing.
+- Handles Dice's current two-step application wizard.
 
 ---
 
@@ -21,7 +24,7 @@ Automatically applies to **Easy Apply** jobs on [Dice.com](https://www.dice.com)
 **1. Clone the repo**
 
 ```bash
-git clone https://github.com/your-username/AutoDice.git
+git clone https://github.com/bhanuprasadthota/AutoDice.git
 cd AutoDice
 ```
 
@@ -47,7 +50,7 @@ Open `config.py` and fill in:
 | `JOB_TITLES` | List of roles to search for |
 | `LOCATION` | Search location (e.g. `"USA"`, `"Remote"`) |
 
-`config.py` is git-ignored — your credentials will never be committed.
+`config.py` is git-ignored, so your credentials will never be committed.
 
 ---
 
@@ -60,17 +63,61 @@ python DiceC.py
 A visible Chrome window will open so you can monitor the bot. It will:
 
 1. Log in to Dice.com
-2. Search each role in `JOB_TITLES` with the **Easy Apply** filter active
-3. Open every listing and click **Easy Apply**
-4. Submit the application (advancing past review pages if needed)
-5. Skip any jobs already applied to
+2. Load cached links for each role when available
+3. Search Dice only when a role has no cached links yet
+4. Open each unprocessed listing
+5. Submit Easy Apply applications
+6. Record the result in `autodice-logs/applications.csv`
+
+---
+
+## Runtime Options
+
+Use environment variables to control each run:
+
+| Variable | Description |
+|---|---|
+| `AUTODICE_MAX_APPLICATIONS` | Stop after this many visited jobs. `0` means no limit. |
+| `AUTODICE_MAX_SEARCH_PAGES` | Limit how many result pages are scraped per new role. `0` means no limit. |
+| `AUTODICE_JOB_TITLES` | Comma-separated role override for a single run. |
+| `AUTODICE_DRY_RUN` | Set to `1` to stop before final submission. |
+| `AUTODICE_STOP_AT_APPLY` | With dry run enabled, stop before clicking Easy Apply. |
+| `AUTODICE_LOG_DIR` | Directory for CSV logs and cached job links. |
+| `AUTODICE_MAX_LOG_BYTES` | Rotate `applications.csv` after this size in bytes. |
+
+Examples:
+
+```bash
+AUTODICE_MAX_APPLICATIONS=10 python DiceC.py
+```
+
+```bash
+AUTODICE_JOB_TITLES="SAP ABAP Developer,Salesforce Developer" AUTODICE_MAX_SEARCH_PAGES=1 python DiceC.py
+```
+
+```bash
+AUTODICE_DRY_RUN=1 AUTODICE_MAX_APPLICATIONS=5 python DiceC.py
+```
+
+---
+
+## Output Files
+
+AutoDice writes runtime files under `autodice-logs/`:
+
+| File | Purpose |
+|---|---|
+| `applications.csv` | One row per visited job with status and message. |
+| `job_queue.csv` | Cached Dice job links by role. |
+
+If `applications.csv` reaches `AUTODICE_MAX_LOG_BYTES`, it is rotated with a timestamp and a fresh file is created.
 
 ---
 
 ## Notes
 
-- **Easy Apply only** — the bot skips any listing that requires an external application.
-- **No screening questions** — jobs with required screening questions will be skipped at the submit step. Apply to those manually.
+- **Easy Apply only**: the bot skips any listing that requires an external application.
+- Jobs with required custom questions may be marked as `stuck` and should be reviewed manually.
 - The browser runs in headed (visible) mode intentionally so you can intervene if needed.
 
 ---

@@ -6,7 +6,7 @@ import csv
 import os
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from playwright.async_api import async_playwright, Page
 
@@ -14,11 +14,21 @@ from config import DICE_EMAIL, DICE_PASSWORD, JOB_TITLES, LOCATION
 
 
 MAX_APPLICATIONS = int(os.getenv("AUTODICE_MAX_APPLICATIONS", "0") or "0")
+MAX_SEARCH_PAGES = int(os.getenv("AUTODICE_MAX_SEARCH_PAGES", "0") or "0")
+DRY_RUN = os.getenv("AUTODICE_DRY_RUN", "").lower() in {"1", "true", "yes"}
+STOP_AT_APPLY = os.getenv("AUTODICE_STOP_AT_APPLY", "").lower() in {"1", "true", "yes"}
 DEBUG_DIR = Path(os.getenv("AUTODICE_DEBUG_DIR", "autodice-debug"))
 LOG_DIR = Path(os.getenv("AUTODICE_LOG_DIR", "autodice-logs"))
 LOG_FILE = LOG_DIR / "applications.csv"
+QUEUE_FILE = LOG_DIR / "job_queue.csv"
 LOG_MAX_BYTES = int(os.getenv("AUTODICE_MAX_LOG_BYTES", str(5 * 1024 * 1024)))
 LOG_COLUMNS = ["timestamp", "role", "link", "title", "status", "message"]
+QUEUE_COLUMNS = ["discovered_at", "role", "link"]
+SEARCH_ROLES = [
+    role.strip()
+    for role in os.getenv("AUTODICE_JOB_TITLES", "").split(",")
+    if role.strip()
+] or JOB_TITLES
 
 
 # Selectors for the Easy Apply / Apply button
@@ -46,7 +56,6 @@ SUBMIT_SELECTORS = [
     "button:has-text('Submit')",
     "button[data-react-aria-pressable='true']:has-text('Submit')",
     "button.ja-submit-btn",
-    "button[type='submit']",
     "//button[contains(., 'Submit')]",
 ]
 
@@ -62,11 +71,12 @@ NEXT_SELECTORS = [
 ]
 
 CONFIRMATION_SELECTORS = [
-    "p.app-text",
+    "text=/application is on its way/i",
     "text=/application submitted/i",
+    "text=/Fantastic!/i",
     "text=/successfully applied/i",
-    "text=/you applied/i",
     "text=/already applied/i",
+    "text=/applied on/i",
 ]
 
 
@@ -89,7 +99,7 @@ class ApplicationLog:
                         if link:
                             links.add(link)
             except Exception as exc:
-                print(f"  ⚠  Could not read log {csv_path}: {exc}")
+                print(f"  Warning: could not read log {csv_path}: {exc}")
         return links
 
     def append(self, role: str, link: str, title: str, status: str, message: str = "") -> None:
@@ -127,8 +137,60 @@ class ApplicationLog:
             suffix += 1
 
         self.path.rename(rotated)
-        print(f"  🗂  Log reached {self.max_bytes} bytes; started {self.path}")
+        print(f"  Log reached {self.max_bytes} bytes; started {self.path}")
         self._ensure_current_file()
+
+
+class JobQueue:
+    """CSV-backed cache of extracted Dice job links."""
+
+    def __init__(self, path: Path = QUEUE_FILE):
+        self.path = path
+        self.path.parent.mkdir(exist_ok=True)
+        self._ensure_current_file()
+
+    def links_for_role(self, role: str) -> list[str]:
+        rows = self._read_rows()
+        seen: set[str] = set()
+        links: list[str] = []
+        for row in rows:
+            if row.get("role") != role:
+                continue
+            link = row.get("link")
+            if link and link not in seen:
+                links.append(link)
+                seen.add(link)
+        return links
+
+    def add_links(self, role: str, links: list[str]) -> int:
+        existing = {row.get("link") for row in self._read_rows()}
+        now = datetime.now(timezone.utc).isoformat()
+        new_rows = [
+            {"discovered_at": now, "role": role, "link": link}
+            for link in links
+            if link not in existing
+        ]
+        if not new_rows:
+            return 0
+
+        with self.path.open("a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=QUEUE_COLUMNS)
+            writer.writerows(new_rows)
+        return len(new_rows)
+
+    def _read_rows(self) -> list[dict[str, str]]:
+        try:
+            with self.path.open(newline="", encoding="utf-8") as file:
+                return list(csv.DictReader(file))
+        except Exception as exc:
+            print(f"  Warning: could not read queue {self.path}: {exc}")
+            return []
+
+    def _ensure_current_file(self) -> None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            with self.path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=QUEUE_COLUMNS)
+                writer.writeheader()
 
 
 async def click_when_enabled(locator, timeout_ms: int = 20000) -> bool:
@@ -161,14 +223,39 @@ async def click_when_enabled(locator, timeout_ms: int = 20000) -> bool:
     return False
 
 
+def build_search_url(role: str) -> str:
+    """Build a Dice search URL with Easy Apply enabled up front."""
+    query = urlencode(
+        {
+            "filters.easyApply": "true",
+            "q": role,
+            "location": LOCATION,
+        }
+    )
+    return f"https://www.dice.com/jobs?{query}"
+
+
 async def has_confirmation(page: Page) -> bool:
     """Return whether Dice is showing an applied/submitted confirmation."""
+    if "/wizard/success" in page.url:
+        return True
+
     for sel in CONFIRMATION_SELECTORS:
         try:
             if await page.locator(sel).first.is_visible(timeout=500):
                 return True
         except Exception:
             continue
+    return False
+
+
+async def wait_for_confirmation(page: Page, timeout_ms: int = 12000) -> bool:
+    """Wait for Dice to show a submitted/already-applied confirmation."""
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while asyncio.get_running_loop().time() < deadline:
+        if await has_confirmation(page):
+            return True
+        await page.wait_for_timeout(500)
     return False
 
 
@@ -179,7 +266,7 @@ async def dump_application_state(page: Page, title: str) -> None:
     screenshot = DEBUG_DIR / f"{safe_title or 'application'}-stuck.png"
     try:
         await page.screenshot(path=str(screenshot), full_page=True)
-        print(f"  🧭 Debug screenshot: {screenshot}")
+        print(f"  Debug screenshot: {screenshot}")
     except Exception:
         pass
 
@@ -201,7 +288,7 @@ async def dump_application_state(page: Page, title: str) -> None:
                     pending: el.getAttribute('data-pending') || ''
                 }))"""
         )
-        print("  🧭 Visible actions:")
+        print("  Visible actions:")
         for button in buttons:
             text = button.get("text") or "<no text>"
             disabled = button.get("disabled") or "false"
@@ -233,7 +320,7 @@ async def dump_application_state(page: Page, title: str) -> None:
                 }))"""
         )
         if fields:
-            print("  🧭 Visible fields:")
+            print("  Visible fields:")
             for field in fields:
                 label = field.get("label") or field.get("name") or "<unnamed>"
                 print(
@@ -248,19 +335,13 @@ async def get_apply_button(page: Page) -> tuple:
     """Return (state, button, message).
 
     state values:
-      'applied'    — already applied, nothing to do
-      'easy_apply' — Easy Apply button found and ready
-      'none'       — no applicable button found
+      'applied'    - already applied, nothing to do
+      'easy_apply' - Easy Apply button found and ready
+      'none'       - no applicable button found
     """
     for _ in range(12):  # poll up to ~6 s
-        if await page.locator("p.app-text").count() > 0:
-            date_el = page.locator("span.app-date")
-            date = (
-                await date_el.get_attribute("title")
-                if await date_el.count() > 0
-                else "unknown date"
-            )
-            return "applied", None, f"Already applied on {date}"
+        if await has_confirmation(page):
+            return "applied", None, "Already applied"
 
         for sel in APPLY_SELECTORS:
             btn = page.locator(sel).first
@@ -280,7 +361,7 @@ async def collect_job_links(page: Page) -> list[str]:
     all_links: list[str] = []
     seen_links: set[str] = set()
     page_num = 1
-    print(f"  📄 Page {page_num}")
+    print(f"  Page {page_num}")
 
     while True:
         cards = page.locator("a[data-testid='job-search-job-detail-link']")
@@ -293,6 +374,9 @@ async def collect_job_links(page: Page) -> list[str]:
                     seen_links.add(full_link)
 
         next_btn = page.locator("span[aria-label='Next']")
+
+        if MAX_SEARCH_PAGES and page_num >= MAX_SEARCH_PAGES:
+            break
 
         if not await next_btn.is_visible():
             break
@@ -308,51 +392,48 @@ async def collect_job_links(page: Page) -> list[str]:
             break
 
         page_num += 1
-        print(f"  📄 Page {page_num}")
+        print(f"  Page {page_num}")
         await page.wait_for_timeout(2000)
 
     return list(all_links)
 
 
 async def enable_easy_apply_filter(page: Page) -> bool:
-    """Open Dice filters and turn on Easy apply, verifying the URL flag."""
+    """Verify Dice accepted the Easy Apply filter from the search URL."""
+    if "filters.easyApply=true" not in page.url:
+        print("  Warning: Easy Apply filter did not appear in URL")
+        return False
+
     try:
-        await page.locator("button:has-text('All filters')").click()
-        easy_apply = page.locator("label:has-text('Easy apply')").first
-
+        easy_apply = page.locator("input[name='easyApply']").first
         if await easy_apply.count() == 0:
-            print("  ⚠  Easy apply filter not found")
+            print("  Warning: Easy Apply filter checkbox not found in UI")
             return False
-        if await easy_apply.get_attribute("data-disabled") == "true":
-            print("  ⚠  Easy apply filter is disabled for this search")
+        checked = await easy_apply.is_checked()
+        if not checked:
+            print("  Warning: Easy Apply filter is in URL but not checked in UI")
             return False
-
-        await easy_apply.click()
-        await page.locator("button:has-text('Apply filters')").click()
-        await page.wait_for_timeout(1500)
-
-        if "filters.easyApply=true" not in page.url:
-            print("  ⚠  Easy apply filter did not appear in URL")
-            return False
-
         return True
     except Exception as exc:
-        print(f"  ⚠  Could not set Easy apply filter: {exc}")
+        print(f"  Warning: could not verify Easy Apply filter: {exc}")
         return False
 
 
-async def try_submit(page: Page) -> bool:
-    """Locate the Submit button, wait for it to be enabled, click, and verify confirmation."""
-    submit_btn = None
+async def get_visible_submit_button(page: Page):
+    """Return the first visible final Submit button, if present."""
     for sel in SUBMIT_SELECTORS:
         try:
             candidate = page.locator(sel)
             if await candidate.count() > 0 and await candidate.first.is_visible():
-                submit_btn = candidate.first
-                break
+                return candidate.first
         except Exception:
             continue
+    return None
 
+
+async def try_submit(page: Page) -> bool:
+    """Locate the Submit button, wait for it to be enabled, click, and verify confirmation."""
+    submit_btn = await get_visible_submit_button(page)
     if not submit_btn:
         return False
 
@@ -360,22 +441,20 @@ async def try_submit(page: Page) -> bool:
         aria = await submit_btn.get_attribute("aria-disabled")
         pending = await submit_btn.get_attribute("data-pending")
         if aria == "true" or pending == "true":
-            print("  ⚠  Submit is disabled/pending")
+            print("  Warning: Submit is disabled or pending")
             return False
     except Exception:
         pass
 
     if not await click_when_enabled(submit_btn, timeout_ms=30000):
-        print("  ⚠  Submit never became clickable")
+        print("  Warning: Submit never became clickable")
         return False
 
-    await page.wait_for_timeout(2000)
-
-    if await has_confirmation(page):
-        print("  ✅ Submitted!")
+    if await wait_for_confirmation(page):
+        print("  Submitted")
         return True
 
-    print("  ⚠  Submit clicked but confirmation not detected")
+    print("  Warning: Submit clicked but confirmation not detected")
     return False
 
 
@@ -384,36 +463,44 @@ async def apply_to_job(page: Page, link: str, role: str) -> dict[str, str]:
     try:
         await page.goto(link, timeout=15000)
     except Exception:
-        print("  ❌ Page failed to load")
+        print("  Error: page failed to load")
         return {"title": role, "status": "load_failed", "message": "Page failed to load"}
 
     title_el = page.locator("h1[data-cy='jobTitle']")
     title = (await title_el.inner_text()).strip() if await title_el.count() else role
-    print(f"  💼 {title}")
+    print(f"  Job: {title}")
 
     state, btn, msg = await get_apply_button(page)
 
     if state == "applied":
-        print(f"  ✔  {msg}")
+        print(f"  {msg}")
         return {"title": title, "status": "already_applied", "message": msg or ""}
     if state == "none":
-        print("  ❌ No Easy Apply button found")
+        print("  No Easy Apply button found")
         return {"title": title, "status": "no_easy_apply", "message": "No Easy Apply button found"}
 
-    # Wait for the UI to fully settle — Dice sometimes shows "Applied" a beat after load
+    # Wait for the UI to fully settle. Dice sometimes shows "Applied" a beat after load.
     await page.wait_for_timeout(1200)
     if await has_confirmation(page):
-        print("  ✔  Already applied (detected after page settle)")
+        print("  Already applied (detected after page settle)")
         return {
             "title": title,
             "status": "already_applied",
             "message": "Detected after page settle",
         }
 
+    if DRY_RUN and STOP_AT_APPLY:
+        print("  Dry run: Easy Apply button detected, not clicking")
+        return {
+            "title": title,
+            "status": "dry_run_easy_apply_ready",
+            "message": "Easy Apply button detected",
+        }
+
     try:
         await btn.click()
     except Exception:
-        print("  ❌ Apply button disappeared before click")
+        print("  Error: Apply button disappeared before click")
         return {
             "title": title,
             "status": "apply_button_disappeared",
@@ -424,8 +511,16 @@ async def apply_to_job(page: Page, link: str, role: str) -> dict[str, str]:
 
     for _ in range(4):
         if await has_confirmation(page):
-            print("  ✅ Submitted!")
+            print("  Submitted")
             return {"title": title, "status": "submitted", "message": "Submitted"}
+
+        if DRY_RUN and await get_visible_submit_button(page):
+            print("  Dry run: final Submit detected, not clicking")
+            return {
+                "title": title,
+                "status": "dry_run_ready_to_submit",
+                "message": "Final Submit button detected",
+            }
 
         if await try_submit(page):
             return {"title": title, "status": "submitted", "message": "Submitted"}
@@ -439,7 +534,7 @@ async def apply_to_job(page: Page, link: str, role: str) -> dict[str, str]:
             break
 
     await dump_application_state(page, title)
-    print("  ⚠  Could not complete submission — moving on")
+    print("  Warning: could not complete submission, moving on")
     return {
         "title": title,
         "status": "stuck",
@@ -452,8 +547,9 @@ async def run(playwright) -> None:
     page = await browser.new_page()
     seen: set[str] = set()  # deduplicate across role searches within a session
     application_log = ApplicationLog()
+    job_queue = JobQueue()
     logged_links = application_log.processed_links()
-    print(f"🧾 Loaded {len(logged_links)} previously logged job links")
+    print(f"Loaded {len(logged_links)} previously logged job links")
 
     # ── Login ──────────────────────────────────────────────────────────────
     await page.goto("https://www.dice.com/dashboard/login")
@@ -463,22 +559,30 @@ async def run(playwright) -> None:
     await page.fill("input[type=password]", DICE_PASSWORD)
     await page.click("button[type=submit]")
     await page.wait_for_load_state("networkidle")
-    print("✔  Logged in\n")
+    print("Logged in\n")
 
     # ── Search & apply ─────────────────────────────────────────────────────
     applied_count = 0
-    for role in JOB_TITLES:
+    for role in SEARCH_ROLES:
         print(f"🔍 {role}")
 
-        await page.goto(f"https://www.dice.com/jobs?q={role}&location={LOCATION}")
-        await page.wait_for_timeout(2000)
+        queued_links = job_queue.links_for_role(role)
+        if queued_links:
+            print(f"  Using {len(queued_links)} cached links from CSV")
+            links = queued_links
+        else:
+            await page.goto(build_search_url(role))
+            await page.wait_for_timeout(2000)
 
-        # Filter to Easy Apply jobs only
-        if not await enable_easy_apply_filter(page):
-            print("  ⚠  Skipping search because Easy Apply is unavailable\n")
-            continue
+            # Filter to Easy Apply jobs only
+            if not await enable_easy_apply_filter(page):
+                print("  Warning: skipping search because Easy Apply is unavailable\n")
+                continue
 
-        links = await collect_job_links(page)
+            links = await collect_job_links(page)
+            added = job_queue.add_links(role, links)
+            print(f"  Cached {added} newly extracted links")
+
         skipped_session = sum(1 for link in links if link in seen)
         skipped_logged = sum(1 for link in links if link in logged_links)
         new_links = [
@@ -492,7 +596,7 @@ async def run(playwright) -> None:
 
         for idx, link in enumerate(new_links, 1):
             if MAX_APPLICATIONS and applied_count >= MAX_APPLICATIONS:
-                print(f"\n🛑 Reached AUTODICE_MAX_APPLICATIONS={MAX_APPLICATIONS}")
+                print(f"\nReached AUTODICE_MAX_APPLICATIONS={MAX_APPLICATIONS}")
                 await browser.close()
                 return
 
@@ -509,7 +613,7 @@ async def run(playwright) -> None:
             applied_count += 1
 
     await browser.close()
-    print("\n🎉 All done!")
+    print("\nAll done.")
 
 
 async def main() -> None:

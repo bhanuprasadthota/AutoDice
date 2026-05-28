@@ -1,10 +1,8 @@
-# ─────────────────────────────────────────────────────────
-#  AutoDice — User Configuration
+# AutoDice user configuration
 #
-#  1. Copy this file:   cp config.example.py config.py
-#  2. Fill in your details below
-#  3. Never commit config.py  (it is already in .gitignore)
-# ─────────────────────────────────────────────────────────
+# 1. Copy this file: cp config.example.py config.py
+# 2. Fill in your Dice account details.
+# 3. Never commit config.py. It is already ignored by git.
 
 # Your Dice.com login credentials
 DICE_EMAIL = "your_email@example.com"
@@ -30,5 +28,5 @@ JOB_TITLES = [
     "Python Backend Engineer AI",
 ]
 
-# Search location — e.g. "USA", "Remote", "New York"
+# Search location, for example: "USA", "Remote", "New York"
 LOCATION = "USA"
