@@ -6,6 +6,37 @@ AutoDice is a Playwright-based Python bot that logs into your Dice.com account, 
 
 ---
 
+## Demo
+
+<!-- Add a demo GIF or screenshot here once you have one.
+
+     How to record a GIF on macOS:
+       - Gifox (gifox.io) — lightweight menu bar recorder, exports GIF directly
+       - LICEcap (github.com/nicowillis/licecap) — free, drag to select region
+       - Built-in: record with QuickTime → convert with ffmpeg:
+           ffmpeg -i demo.mov -vf "fps=10,scale=800:-1" demo.gif
+
+     Suggested clip (30–60 s):
+       1. Bot launches, Chrome opens
+       2. Dice.com login happens automatically
+       3. Search results load with Easy Apply filter
+       4. Two or three job listings open and get submitted
+       5. Terminal shows "submitted" lines and CSV written
+
+     Once you have the file, drop it into the repo root and replace this
+     comment block with:
+
+       ![AutoDice demo](demo.gif)
+
+     Or for a static screenshot:
+
+       ![AutoDice screenshot](screenshot.png)
+-->
+
+> **Recording tip:** run with `AUTODICE_MAX_APPLICATIONS=3 AUTODICE_DRY_RUN=1 python DiceC.py` to get a clean, short clip without submitting real applications.
+
+---
+
 ## What it does
 
 ```
